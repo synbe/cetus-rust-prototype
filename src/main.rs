@@ -24,6 +24,12 @@ struct Args {
     /// Optional path to ffmpeg executable (env FFMPEG_PATH overrides)
     #[clap(long)]
     ffmpeg: Option<PathBuf>,
+    /// Frame codec to capture: png (default) or mjpeg
+    #[clap(long, default_value = "png")]
+    frame_codec: String,
+    /// JPEG quality when using --frame-codec=mjpeg (1-100)
+    #[clap(long, default_value = "80")]
+    jpeg_quality: u8,
 }
 
 #[derive(Deserialize, Debug)]
@@ -97,6 +103,13 @@ fn main() -> Result<()> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "ffmpeg".to_string());
 
+    // validate frame codec
+    let frame_codec = args.frame_codec.to_lowercase();
+    if frame_codec != "png" && frame_codec != "mjpeg" {
+        anyhow::bail!("unsupported frame codec '{}': only 'png' and 'mjpeg' are supported in this prototype", frame_codec);
+    }
+    let jpeg_quality = args.jpeg_quality.clamp(1, 100) as i64;
+
     // Launch browser
     let mut launch_opts = LaunchOptionsBuilder::default();
     launch_opts = launch_opts.headless(true);
@@ -124,19 +137,32 @@ fn main() -> Result<()> {
     eprintln!("Composition: width={} height={} fps={} duration={} frames={}",
         width, height, fps, duration, total_frames);
 
-    // spawn ffmpeg
+    // spawn ffmpeg with correct input codec for image2pipe
+    let mut ffmpeg_args = vec!["-y".to_string()];
+    ffmpeg_args.push("-f".to_string());
+    ffmpeg_args.push("image2pipe".to_string());
+    if frame_codec == "mjpeg" {
+        ffmpeg_args.push("-vcodec".to_string());
+        ffmpeg_args.push("mjpeg".to_string());
+    } else {
+        ffmpeg_args.push("-vcodec".to_string());
+        ffmpeg_args.push("png".to_string());
+    }
+    ffmpeg_args.push("-r".to_string());
+    ffmpeg_args.push(fps.to_string());
+    ffmpeg_args.push("-i".to_string());
+    ffmpeg_args.push("pipe:0".to_string());
+    // rest of encoding args
+    ffmpeg_args.push("-c:v".to_string());
+    ffmpeg_args.push("libx264".to_string());
+    ffmpeg_args.push("-pix_fmt".to_string());
+    ffmpeg_args.push("yuv420p".to_string());
+    ffmpeg_args.push("-movflags".to_string());
+    ffmpeg_args.push("+faststart".to_string());
+    ffmpeg_args.push(args.output.to_string_lossy().to_string());
+
     let mut ffmpeg = Command::new(&ffmpeg_path)
-        .args(&[
-            "-y",
-            "-f", "image2pipe",
-            "-vcodec", "png",
-            "-r", &fps.to_string(),
-            "-i", "pipe:0",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            args.output.to_str().unwrap(),
-        ])
+        .args(ffmpeg_args.iter())
         .stdin(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -150,12 +176,26 @@ fn main() -> Result<()> {
         let _ = tab.evaluate(&script, true).context("evaluate seek script")?;
         // tiny delay to allow layout settle (may be unnecessary)
         thread::sleep(Duration::from_millis(5));
-        // capture screenshot as PNG (full page false; clip size)
-        let png_data = tab
-            .capture_screenshot(headless_chrome::protocol::page::ScreenshotFormat::Png, None, Some((width, height)))
-            .context("capture screenshot")?;
+
+        // capture screenshot in requested format
+        let img_data = if frame_codec == "mjpeg" {
+            tab.capture_screenshot(
+                headless_chrome::protocol::page::ScreenshotFormat::Jpeg,
+                Some(jpeg_quality),
+                Some((width, height)),
+            )
+            .context("capture jpeg screenshot")?
+        } else {
+            tab.capture_screenshot(
+                headless_chrome::protocol::page::ScreenshotFormat::Png,
+                None,
+                Some((width, height)),
+            )
+            .context("capture png screenshot")?
+        };
+
         // write to ffmpeg stdin
-        stdin.write_all(&png_data).context("write frame to ffmpeg")?;
+        stdin.write_all(&img_data).context("write frame to ffmpeg")?;
         eprintln!("Wrote frame {}/{}", frame + 1, total_frames);
     }
 
