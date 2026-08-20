@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use serde::Deserialize;
+use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -30,6 +31,12 @@ struct Args {
     /// JPEG quality when using --frame-codec=mjpeg (1-100)
     #[clap(long, default_value = "80")]
     jpeg_quality: u8,
+    /// Optional frames directory to write cached frames (if set, frames are written and then encoded)
+    #[clap(long)]
+    frames_dir: Option<PathBuf>,
+    /// Keep frames after encoding (only relevant when --frames-dir is set)
+    #[clap(long)]
+    keep_frames: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -89,6 +96,42 @@ fn parse_composition_from_page(tab: &headless_chrome::Tab) -> Result<Composition
     Ok(comp)
 }
 
+fn write_frame_file(dir: &Path, frame_idx: usize, ext: &str, data: &[u8]) -> Result<PathBuf> {
+    fs::create_dir_all(dir).context("create frames dir")?;
+    let filename = format!("frame-{:09}.{}", frame_idx, ext);
+    let path = dir.join(&filename);
+    let tmp = dir.join(format!("{}.tmp", filename));
+    fs::write(&tmp, data).with_context(|| format!("write temp frame {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("rename temp frame {} -> {}", tmp.display(), path.display()))?;
+    Ok(path)
+}
+
+fn encode_frames_with_ffmpeg(ffmpeg_path: &str, frames_dir: &Path, ext: &str, fps: usize, output: &Path) -> Result<()> {
+    // build ffmpeg args: -y -framerate {fps} -i {frames_dir}/frame-%09d.{ext} -c:v libx264 -pix_fmt yuv420p output
+    let pattern = format!("{}/frame-%09d.{}", frames_dir.to_string_lossy(), ext);
+    let args = [
+        "-y",
+        "-framerate",
+        &fps.to_string(),
+        "-i",
+        &pattern,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        output.to_string_lossy().as_ref(),
+    ];
+    let status = Command::new(ffmpeg_path)
+        .args(&args)
+        .stderr(Stdio::inherit())
+        .status()
+        .context("spawn ffmpeg for frame dir encoding")?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg exited with {}", status);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -136,6 +179,48 @@ fn main() -> Result<()> {
 
     eprintln!("Composition: width={} height={} fps={} duration={} frames={}",
         width, height, fps, duration, total_frames);
+
+    // decide on extension for cached frames
+    let ext = if frame_codec == "mjpeg" { "jpg" } else { "png" };
+
+    // If frames_dir provided, write frames to disk then invoke ffmpeg on them.
+    if let Some(frames_dir) = args.frames_dir.as_ref() {
+        eprintln!("Writing frames to {} ...", frames_dir.display());
+        for frame in 0..total_frames {
+            let script = build_seek_script(frame, fps as usize);
+            let _ = tab.evaluate(&script, true).context("evaluate seek script")?;
+            thread::sleep(Duration::from_millis(5));
+
+            let img_data = if frame_codec == "mjpeg" {
+                tab.capture_screenshot(
+                    headless_chrome::protocol::page::ScreenshotFormat::Jpeg,
+                    Some(jpeg_quality),
+                    Some((width, height)),
+                )
+                .context("capture jpeg screenshot")?
+            } else {
+                tab.capture_screenshot(
+                    headless_chrome::protocol::page::ScreenshotFormat::Png,
+                    None,
+                    Some((width, height)),
+                )
+                .context("capture png screenshot")?
+            };
+
+            write_frame_file(frames_dir, frame, ext, &img_data)?;
+            eprintln!("Saved frame {}/{}", frame + 1, total_frames);
+        }
+
+        // encode frames to output via ffmpeg
+        encode_frames_with_ffmpeg(&ffmpeg_path, frames_dir, ext, fps as usize, &args.output)?;
+
+        if !args.keep_frames {
+            let _ = fs::remove_dir_all(frames_dir);
+        }
+
+        eprintln!("Rendered {} from frames in {}", args.output.display(), frames_dir.display());
+        return Ok(());
+    }
 
     // spawn ffmpeg with correct input codec for image2pipe
     let mut ffmpeg_args = vec!["-y".to_string()];
